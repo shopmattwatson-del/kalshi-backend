@@ -1,81 +1,78 @@
 """
-KalshiPRO Backend — FastAPI proxy that handles RSA-PSS signing for Kalshi API
-Deploy to Railway or Render. Set env vars: KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY
+KalshiPRO Backend - FastAPI proxy that handles RSA-PSS signing for Kalshi API
+Deploy to Railway. Set env vars: KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY
 """
 
 import os
 import base64
-import hashlib
 import time
 import json
 import httpx
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# CONFIG
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 API_KEY_ID  = os.environ.get("KALSHI_API_KEY_ID", "")
-PRIVATE_KEY_PEM = os.environ.get("KALSHI_PRIVATE_KEY", "")  # Full PEM string
+PRIVATE_KEY_PEM = os.environ.get("KALSHI_PRIVATE_KEY", "")
 
 app = FastAPI(title="KalshiPRO Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Tighten this to your frontend domain after deploy
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── RSA-PSS SIGNING ───────────────────────────────────────────────────────────
+# RSA-PSS SIGNING
 def get_private_key():
     if not PRIVATE_KEY_PEM:
         raise HTTPException(500, "KALSHI_PRIVATE_KEY env var not set")
     pem = PRIVATE_KEY_PEM.replace("\\n", "\n").encode()
     return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
 
-def make_signature(method: str, path: str, timestamp_ms: str, body: str = "") -> str:
-    """Create RSA-PSS signature as required by Kalshi API."""
-    msg = timestamp_ms + method.upper() + path + body
-    private_key = get_private_key()
-    signature = private_key.sign(
-        msg.encode("utf-8"),
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
-        ),
+def make_signature(method: str, path: str, timestamp_ms: str) -> str:
+    # Kalshi signs: timestamp + METHOD + /trade-api/v2/path (NO query params)
+    path_no_query = path.split("?")[0]
+    if not path_no_query.startswith("/trade-api"):
+        path_no_query = "/trade-api/v2" + path_no_query
+    msg = (timestamp_ms + method.upper() + path_no_query).encode("utf-8")
+    key = get_private_key()
+    sig = key.sign(
+        msg,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
         hashes.SHA256(),
     )
-    return base64.b64encode(signature).decode()
+    return base64.b64encode(sig).decode()
 
-def auth_headers(method: str, path: str, body: str = "") -> dict:
+def auth_headers(method: str, path: str) -> dict:
     if not API_KEY_ID:
         raise HTTPException(500, "KALSHI_API_KEY_ID env var not set")
     ts = str(int(time.time() * 1000))
-    sig = make_signature(method, path, ts, body)
     return {
         "Content-Type": "application/json",
         "KALSHI-ACCESS-KEY": API_KEY_ID,
         "KALSHI-ACCESS-TIMESTAMP": ts,
-        "KALSHI-ACCESS-SIGNATURE": sig,
+        "KALSHI-ACCESS-SIGNATURE": make_signature(method, path, ts),
     }
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+# HELPERS
 async def kalshi_get(path: str, params: dict = None, require_auth: bool = True):
     full_path = path
     if params:
         qs = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
         if qs:
             full_path = f"{path}?{qs}"
-    headers = auth_headers("GET", full_path) if require_auth else {"Content-Type": "application/json"}
+    headers = auth_headers("GET", path) if require_auth else {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(f"{KALSHI_BASE}{full_path}", headers=headers)
         if not r.is_success:
@@ -84,7 +81,7 @@ async def kalshi_get(path: str, params: dict = None, require_auth: bool = True):
 
 async def kalshi_post(path: str, body: dict):
     body_str = json.dumps(body)
-    headers = auth_headers("POST", path, body_str)
+    headers = auth_headers("POST", path)
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(f"{KALSHI_BASE}{path}", headers=headers, content=body_str)
         if not r.is_success:
@@ -99,11 +96,10 @@ async def kalshi_delete(path: str):
             raise HTTPException(r.status_code, r.text)
         return r.json()
 
-# ── PUBLIC ENDPOINTS (no auth) ────────────────────────────────────────────────
+# PUBLIC ENDPOINTS
 @app.get("/health")
 async def health():
-    configured = bool(API_KEY_ID and PRIVATE_KEY_PEM)
-    return {"status": "ok", "configured": configured, "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "configured": bool(API_KEY_ID and PRIVATE_KEY_PEM), "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/markets")
 async def get_markets(limit: int = 25, status: str = "open", cursor: Optional[str] = None):
@@ -124,7 +120,7 @@ async def get_orderbook(ticker: str, depth: int = 10):
 async def get_events(limit: int = 20, status: str = "open"):
     return await kalshi_get("/events", {"limit": limit, "status": status}, require_auth=False)
 
-# ── AUTHENTICATED ENDPOINTS ───────────────────────────────────────────────────
+# AUTHENTICATED ENDPOINTS
 @app.get("/portfolio/balance")
 async def get_balance():
     return await kalshi_get("/portfolio/balance")
@@ -147,14 +143,14 @@ async def get_orders(status: Optional[str] = None, limit: int = 100):
 async def get_fills(limit: int = 50):
     return await kalshi_get("/portfolio/fills", {"limit": limit})
 
-# ── ORDER MODELS ──────────────────────────────────────────────────────────────
+# ORDER MODELS
 class OrderRequest(BaseModel):
     ticker: str
-    action: str          # "buy" or "sell"
-    side: str            # "yes" or "no"
-    count: int           # number of contracts
-    type: str            # "limit" or "market"
-    yes_price: Optional[int] = None   # cents (1-99), required for limit
+    action: str
+    side: str
+    count: int
+    type: str
+    yes_price: Optional[int] = None
     no_price: Optional[int] = None
     client_order_id: Optional[str] = None
 
@@ -163,16 +159,10 @@ class AmendRequest(BaseModel):
     yes_price: Optional[int] = None
     no_price: Optional[int] = None
 
-# ── ORDER ENDPOINTS ───────────────────────────────────────────────────────────
+# ORDER ENDPOINTS
 @app.post("/portfolio/orders")
 async def place_order(order: OrderRequest):
-    body = {
-        "ticker": order.ticker,
-        "action": order.action,
-        "side": order.side,
-        "count": order.count,
-        "type": order.type,
-    }
+    body = {"ticker": order.ticker, "action": order.action, "side": order.side, "count": order.count, "type": order.type}
     if order.yes_price is not None:
         body["yes_price"] = order.yes_price
     if order.no_price is not None:
@@ -190,7 +180,6 @@ async def amend_order(order_id: str, req: AmendRequest):
     body = {k: v for k, v in req.dict().items() if v is not None}
     return await kalshi_post(f"/portfolio/orders/{order_id}/amend", body)
 
-# ── EXCHANGE STATUS ───────────────────────────────────────────────────────────
 @app.get("/exchange/status")
 async def exchange_status():
     return await kalshi_get("/exchange/status", require_auth=False)
