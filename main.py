@@ -1,3 +1,4 @@
+# v3.1
 """
 KalshiPRO Backend - FastAPI proxy that handles RSA-PSS signing for Kalshi API
 Deploy to Railway. Set env vars: KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY
