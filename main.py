@@ -1,17 +1,10 @@
-# v3.1
 """
-KalshiPRO Backend - FastAPI proxy that handles RSA-PSS signing for Kalshi API
-Deploy to Railway. Set env vars: KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY
+KalshiPRO Backend v4 - FastAPI proxy with RSA-PSS signing + WebSocket proxy
 """
-
-import os
-import base64
-import time
-import json
-import httpx
+import os, base64, time, json, asyncio
+import httpx, websockets
 from datetime import datetime, timezone
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -19,224 +12,155 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 
-# CONFIG
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-API_KEY_ID  = os.environ.get("KALSHI_API_KEY_ID", "")
+KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
 PRIVATE_KEY_PEM = os.environ.get("KALSHI_PRIVATE_KEY", "")
 
-app = FastAPI(title="KalshiPRO Backend", version="3.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── Key loading ──────────────────────────────────────────────────────────────
+app = FastAPI(title="KalshiPRO", version="4.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 def get_private_key():
     if not PRIVATE_KEY_PEM:
-        raise HTTPException(500, "KALSHI_PRIVATE_KEY env var not set")
-    
-    # Normalize: replace literal \n with real newlines
-    pem = PRIVATE_KEY_PEM.replace("\\n", "\n").replace("\n", "\n").strip()
-    pem_bytes = pem.encode("utf-8")
-    
-    # Try loading with RSAPublicNumbers approach for PKCS#1 (BEGIN RSA PRIVATE KEY)
-    # The cryptography library needs backend=None for newer versions
-    try:
-        return serialization.load_pem_private_key(pem_bytes, password=None)
-    except Exception as e1:
-        try:
-            return serialization.load_pem_private_key(pem_bytes, password=None, backend=default_backend())
-        except Exception as e2:
-            raise HTTPException(500, f"Key load failed: {repr(e1)}, {repr(e2)}")
+        raise HTTPException(500, "KALSHI_PRIVATE_KEY not set")
+    pem = PRIVATE_KEY_PEM.replace("\\n", "\n").encode()
+    return serialization.load_pem_private_key(pem, password=None, backend=default_backend())
 
-# ── Signing ──────────────────────────────────────────────────────────────────
+def make_signature(method, path, ts):
+    clean = path.split("?")[0]
+    full = f"/trade-api/v2{clean}" if not clean.startswith("/trade-api") else clean
+    msg = ts + method.upper() + full
+    key = get_private_key()
+    sig = key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+    return base64.b64encode(sig).decode()
 
-def make_signature(method: str, path: str, timestamp_ms: str) -> str:
-    path_no_query = path.split("?")[0]
-    if not path_no_query.startswith("/trade-api"):
-        full_path = f"/trade-api/v2{path_no_query}"
-    else:
-        full_path = path_no_query
-
-    msg = (timestamp_ms + method.upper() + full_path).encode("utf-8")
-    private_key = get_private_key()
-    signature = private_key.sign(
-        msg,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(signature).decode()
-
-
-def auth_headers(method: str, path: str) -> dict:
-    if not API_KEY_ID:
-        raise HTTPException(500, "KALSHI_API_KEY_ID env var not set")
+def auth_headers(method, path):
     ts = str(int(time.time() * 1000))
-    sig = make_signature(method, path, ts)
-    return {
-        "Content-Type": "application/json",
-        "KALSHI-ACCESS-KEY": API_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": ts,
-        "KALSHI-ACCESS-SIGNATURE": sig,
-    }
+    return {"Content-Type": "application/json", "KALSHI-ACCESS-KEY": API_KEY_ID, "KALSHI-ACCESS-TIMESTAMP": ts, "KALSHI-ACCESS-SIGNATURE": make_signature(method, path, ts)}
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+async def kget(path, params=None, auth=True):
+    fp = path
+    if params:
+        qs = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+        if qs: fp = f"{path}?{qs}"
+    h = auth_headers("GET", fp) if auth else {"Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{KALSHI_BASE}{fp}", headers=h)
+        if not r.is_success: raise HTTPException(r.status_code, r.text)
+        return r.json()
+
+async def kpost(path, body):
+    bs = json.dumps(body)
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(f"{KALSHI_BASE}{path}", headers=auth_headers("POST", path), content=bs)
+        if not r.is_success: raise HTTPException(r.status_code, r.text)
+        return r.json()
+
+async def kdelete(path):
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.delete(f"{KALSHI_BASE}{path}", headers=auth_headers("DELETE", path))
+        if not r.is_success: raise HTTPException(r.status_code, r.text)
+        return r.json()
 
 @app.get("/health")
-def health():
-    pem = PRIVATE_KEY_PEM.replace("\\n", "\n").strip()
-    # Try to actually load the key and report status
-    try:
-        get_private_key()
-        key_status = "loaded_ok"
-    except Exception as e:
-        key_status = f"error: {str(e)[:100]}"
-    return {
-        "status": "ok",
-        "configured": bool(API_KEY_ID and PRIVATE_KEY_PEM),
-        "key_id_preview": API_KEY_ID[:8] + "..." if API_KEY_ID else "NOT SET",
-        "key_status": key_status,
-        "key_length": len(pem),
-        "has_begin": "BEGIN" in pem,
-    }
-
+async def health():
+    return {"status": "ok", "configured": bool(API_KEY_ID and PRIVATE_KEY_PEM), "key_id_preview": API_KEY_ID[:8] + "..." if API_KEY_ID else "NOT SET", "key_status": "loaded_ok" if PRIVATE_KEY_PEM else "missing", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/markets")
-async def get_markets(limit: int = 20, cursor: str = None, status: str = None,
-                      series_ticker: str = None, event_ticker: str = None):
-    params = {"limit": limit}
-    if cursor:        params["cursor"] = cursor
-    if status:        params["status"] = status
-    if series_ticker: params["series_ticker"] = series_ticker
-    if event_ticker:  params["event_ticker"] = event_ticker
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}/markets", params=params, timeout=15)
-    return r.json()
+async def get_markets(limit: int = 25, status: str = "open", cursor: Optional[str] = None, event_ticker: Optional[str] = None, series_ticker: Optional[str] = None):
+    p = {"limit": limit, "status": status}
+    if cursor: p["cursor"] = cursor
+    if event_ticker: p["event_ticker"] = event_ticker
+    if series_ticker: p["series_ticker"] = series_ticker
+    return await kget("/markets", p, auth=False)
 
-
-@app.get("/events")
-async def get_events(limit: int = 20, cursor: str = None, status: str = None):
-    params = {"limit": limit}
-    if cursor: params["cursor"] = cursor
-    if status: params["status"] = status
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}/events", params=params, timeout=15)
-    return r.json()
-
+@app.get("/markets/{ticker}")
+async def get_market(ticker: str):
+    return await kget(f"/markets/{ticker}", auth=False)
 
 @app.get("/markets/{ticker}/orderbook")
 async def get_orderbook(ticker: str, depth: int = 10):
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}/markets/{ticker}/orderbook",
-                             params={"depth": depth}, timeout=15)
-    return r.json()
+    return await kget(f"/markets/{ticker}/orderbook", {"depth": depth}, auth=False)
 
-
-@app.get("/exchange/status")
-async def exchange_status():
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}/exchange/status", timeout=15)
-    return r.json()
-
+@app.get("/events")
+async def get_events(limit: int = 100, status: str = "open", cursor: Optional[str] = None):
+    p = {"limit": limit, "status": status}
+    if cursor: p["cursor"] = cursor
+    return await kget("/events", p, auth=False)
 
 @app.get("/portfolio/balance")
-async def get_balance():
-    path = "/portfolio/balance"
-    headers = auth_headers("GET", path)
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}{path}", headers=headers, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, r.text)
-    return r.json()
-
+async def get_balance(): return await kget("/portfolio/balance")
 
 @app.get("/portfolio/positions")
-async def get_positions(limit: int = 100, cursor: str = None, ticker: str = None):
-    path = "/portfolio/positions"
-    params = {"limit": limit}
-    if cursor: params["cursor"] = cursor
-    if ticker: params["ticker"] = ticker
-    headers = auth_headers("GET", path)
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}{path}", headers=headers,
-                             params=params, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, r.text)
-    return r.json()
-
+async def get_positions(limit: int = 100, cursor: Optional[str] = None):
+    p = {"limit": limit}
+    if cursor: p["cursor"] = cursor
+    return await kget("/portfolio/positions", p)
 
 @app.get("/portfolio/orders")
-async def get_orders(limit: int = 100, cursor: str = None, ticker: str = None,
-                     status: str = None):
-    path = "/portfolio/orders"
-    params = {"limit": limit}
-    if cursor: params["cursor"] = cursor
-    if ticker: params["ticker"] = ticker
-    if status: params["status"] = status
-    headers = auth_headers("GET", path)
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}{path}", headers=headers,
-                             params=params, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, r.text)
-    return r.json()
-
+async def get_orders(status: Optional[str] = None, limit: int = 100):
+    p = {"limit": limit}
+    if status: p["status"] = status
+    return await kget("/portfolio/orders", p)
 
 @app.get("/portfolio/fills")
-async def get_fills(limit: int = 100, cursor: str = None, ticker: str = None):
-    path = "/portfolio/fills"
-    params = {"limit": limit}
-    if cursor: params["cursor"] = cursor
-    if ticker: params["ticker"] = ticker
-    headers = auth_headers("GET", path)
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{KALSHI_BASE}{path}", headers=headers,
-                             params=params, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, r.text)
-    return r.json()
-
+async def get_fills(limit: int = 50): return await kget("/portfolio/fills", {"limit": limit})
 
 class OrderRequest(BaseModel):
     ticker: str
+    action: str
     side: str
-    type: str = "limit"
-    count: int = 1
+    count: int
+    type: str
     yes_price: Optional[int] = None
     no_price: Optional[int] = None
-    action: str = "buy"
-    expiration_ts: Optional[int] = None
     client_order_id: Optional[str] = None
 
+class AmendRequest(BaseModel):
+    count: Optional[int] = None
+    yes_price: Optional[int] = None
+    no_price: Optional[int] = None
 
 @app.post("/portfolio/orders")
-async def place_order(order: OrderRequest):
-    path = "/portfolio/orders"
-    body_dict = order.dict(exclude_none=True)
-    body_str = json.dumps(body_dict)
-    headers = auth_headers("POST", path)
-    async with httpx.AsyncClient() as client:
-        r = await client.post(f"{KALSHI_BASE}{path}", headers=headers,
-                              content=body_str, timeout=15)
-    if r.status_code not in (200, 201):
-        raise HTTPException(r.status_code, r.text)
-    return r.json()
-
+async def place_order(o: OrderRequest):
+    b = {"ticker": o.ticker, "action": o.action, "side": o.side, "count": o.count, "type": o.type}
+    if o.yes_price is not None: b["yes_price"] = o.yes_price
+    if o.no_price is not None: b["no_price"] = o.no_price
+    if o.client_order_id: b["client_order_id"] = o.client_order_id
+    return await kpost("/portfolio/orders", b)
 
 @app.delete("/portfolio/orders/{order_id}")
-async def cancel_order(order_id: str):
-    path = f"/portfolio/orders/{order_id}"
-    headers = auth_headers("DELETE", path)
-    async with httpx.AsyncClient() as client:
-        r = await client.delete(f"{KALSHI_BASE}{path}", headers=headers, timeout=15)
-    if r.status_code not in (200, 204):
-        raise HTTPException(r.status_code, r.text)
-    return {"cancelled": order_id}
+async def cancel_order(order_id: str): return await kdelete(f"/portfolio/orders/{order_id}")
+
+@app.post("/portfolio/orders/{order_id}/amend")
+async def amend_order(order_id: str, req: AmendRequest):
+    return await kpost(f"/portfolio/orders/{order_id}/amend", {k: v for k, v in req.dict().items() if v is not None})
+
+@app.get("/exchange/status")
+async def exchange_status(): return await kget("/exchange/status", auth=False)
+
+@app.websocket("/ws")
+async def ws_proxy(ws: WebSocket):
+    await ws.accept()
+    ts = str(int(time.time() * 1000))
+    sig = make_signature("GET", "/ws", ts)
+    hdrs = {"KALSHI-ACCESS-KEY": API_KEY_ID, "KALSHI-ACCESS-TIMESTAMP": ts, "KALSHI-ACCESS-SIGNATURE": sig}
+    try:
+        async with websockets.connect(KALSHI_WS_URL, additional_headers=hdrs) as kws:
+            async def to_client():
+                async for msg in kws:
+                    try: await ws.send_text(msg if isinstance(msg, str) else msg.decode())
+                    except: break
+            async def to_kalshi():
+                try:
+                    while True:
+                        data = await ws.receive_text()
+                        await kws.send(data)
+                except: pass
+            await asyncio.gather(to_client(), to_kalshi())
+    except Exception as e:
+        try: await ws.send_text(json.dumps({"type": "error", "msg": str(e)}))
+        except: pass
+    finally:
+        try: await ws.close()
+        except: pass
