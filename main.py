@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from typing import Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.backends import default_backendh
 
 KALSHI_BASE   = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
@@ -146,7 +146,7 @@ import websockets
 async def ws_proxy(ws: WebSocket):
     await ws.accept()
     ts  = str(int(time.time() * 1000))
-    sig = make_signature("GET", "/ws", ts)
+        sig = make_signature("GET", "/trade-api/ws/v2", ts)
     hdrs = {"KALSHI-ACCESS-KEY": API_KEY_ID,
             "KALSHI-ACCESS-TIMESTAMP": ts,
             "KALSHI-ACCESS-SIGNATURE": sig}
